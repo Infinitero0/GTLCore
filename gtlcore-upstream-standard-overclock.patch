@@ -1,0 +1,175 @@
+--- /dev/null
++++ b/src/main/java/org/gtlcore/gtlcore/mixin/gtm/api/recipe/RecipeHelperOverclockMixin.java
+@@ -0,0 +1,36 @@
++package org.gtlcore.gtlcore.mixin.gtm.api.recipe;
++
++import org.gtlcore.gtlcore.utils.StandardOverclockBudget;
++
++import com.gregtechceu.gtceu.api.recipe.GTRecipe;
++import com.gregtechceu.gtceu.api.recipe.OverclockingLogic;
++import com.gregtechceu.gtceu.api.recipe.RecipeHelper;
++import com.gregtechceu.gtceu.api.recipe.logic.OCParams;
++import com.gregtechceu.gtceu.api.recipe.logic.OCResult;
++
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Redirect;
++
++@Mixin(RecipeHelper.class)
++public abstract class RecipeHelperOverclockMixin {
++
++    @Redirect(
++              method = "performOverclocking(Lcom/gregtechceu/gtceu/api/recipe/OverclockingLogic;Lcom/gregtechceu/gtceu/api/recipe/GTRecipe;JJLcom/gregtechceu/gtceu/api/recipe/logic/OCParams;Lcom/gregtechceu/gtceu/api/recipe/logic/OCResult;)V",
++              at = @At(value = "INVOKE", target = "Lcom/gregtechceu/gtceu/api/recipe/logic/OCParams;initialize(JII)V"),
++              remap = false,
++              require = 1)
++    private static void gtlcore$extendStandardOverclockBudget(
++                                                            OCParams receiver, long eut, int duration, int originalBudget,
++                                                            OverclockingLogic logic, GTRecipe recipe,
++                                                            long recipeEUt, long maxVoltage,
++                                                            OCParams params, OCResult result) {
++        boolean standardFourfold = logic == OverclockingLogic.NON_PERFECT_OVERCLOCK ||
++                logic == OverclockingLogic.PERFECT_OVERCLOCK ||
++                logic == OverclockingLogic.NON_PERFECT_OVERCLOCK_SUBTICK ||
++                logic == OverclockingLogic.PERFECT_OVERCLOCK_SUBTICK;
++        int budget = standardFourfold ?
++                StandardOverclockBudget.extend(originalBudget, eut, maxVoltage) : originalBudget;
++        receiver.initialize(eut, duration, budget);
++    }
++}
+--- /dev/null
++++ b/src/main/java/org/gtlcore/gtlcore/utils/StandardOverclockBudget.java
+@@ -0,0 +1,26 @@
++package org.gtlcore.gtlcore.utils;
++
++/** Integer-only power budget for the standard fourfold-EU/t overclock rules. */
++public final class StandardOverclockBudget {
++
++    private StandardOverclockBudget() {}
++
++    /**
++     * Only extends the existing tier budget. The selected overclock logic still
++     * enforces its own voltage, duration, temperature and sub-tick constraints.
++     * Callers must restrict this to standard fourfold-EU/t overclock rules.
++     */
++    public static int extend(int originalBudget, long eut, long maxVoltage) {
++        // Preserve the existing ULV exception and all non-consumer behavior.
++        if (eut <= 8L || maxVoltage <= 0L) return originalBudget;
++
++        int powerBudget = 0;
++        long candidateEUt = eut;
++        // Divide first, so the multiplication cannot overflow a positive long.
++        while (candidateEUt <= maxVoltage / 4L) {
++            candidateEUt *= 4L;
++            ++powerBudget;
++        }
++        return Math.max(originalBudget, powerBudget);
++    }
++}
+--- /dev/null
++++ b/src/test/java/org/gtlcore/gtlcore/utils/StandardOverclockBudgetTest.java
+@@ -0,0 +1,75 @@
++package org.gtlcore.gtlcore.utils;
++
++import java.math.BigInteger;
++import java.util.Random;
++
++/** Standalone numerical regression checks; does not bootstrap Minecraft. */
++public final class StandardOverclockBudgetTest {
++
++    private static int checks;
++
++    public static void main(String[] args) {
++        long parallelEUt = 15_728_640L;
++        long supply = 17_179_869_184L;
++        expect(5, StandardOverclockBudget.extend(4, parallelEUt, supply), "reported 8A MAX case");
++        expect(4, StandardOverclockBudget.extend(4, parallelEUt, 16_106_127_359L), "one EU below fifth OC");
++        expect(5, StandardOverclockBudget.extend(4, parallelEUt, 16_106_127_360L), "exact fifth OC threshold");
++        expect(1, StandardOverclockBudget.extend(0, 15L, 64L), "fix original zero-budget bypass");
++        expect(0, StandardOverclockBudget.extend(0, 15L, 59L), "insufficient power");
++        expect(3, StandardOverclockBudget.extend(3, 7L, supply), "preserve ULV exception");
++        expect(3, StandardOverclockBudget.extend(3, 8L, supply), "preserve exact ULV boundary");
++        expect(-1, StandardOverclockBudget.extend(-1, 0L, supply), "preserve zero EUt");
++        expect(3, StandardOverclockBudget.extend(3, -15L, supply), "preserve generators");
++        expect(3, StandardOverclockBudget.extend(3, Long.MIN_VALUE, supply), "no abs overflow");
++        expect(3, StandardOverclockBudget.extend(3, parallelEUt, 0L), "preserve absent supply");
++        expect(9, StandardOverclockBudget.extend(9, parallelEUt, supply), "never shrink original budget");
++
++        // BigInteger is an independent, overflow-free oracle for long boundaries.
++        Random random = new Random(0x47544cL);
++        for (int i = 0; i < 10_000; ++i) {
++            long eut = 9L + random.nextLong(Long.MAX_VALUE - 8L);
++            long voltage = random.nextLong(Long.MAX_VALUE);
++            int original = random.nextInt(8);
++            expect(Math.max(original, oracle(eut, voltage)),
++                    StandardOverclockBudget.extend(original, eut, voltage), "random power boundary");
++        }
++        for (long eut : new long[] {9L, 15L, parallelEUt, Long.MAX_VALUE / 4L, Long.MAX_VALUE}) {
++            expect(oracle(eut, Long.MAX_VALUE),
++                    StandardOverclockBudget.extend(0, eut, Long.MAX_VALUE), "long maximum boundary");
++        }
++
++        int budget = StandardOverclockBudget.extend(4, parallelEUt, supply);
++        long actualEUt = parallelEUt;
++        double duration = 400;
++        int used = 0;
++        while (budget-- > 0 && actualEUt <= supply / 4L) {
++            actualEUt *= 4L;
++            duration *= 0.5;
++            ++used;
++        }
++        expect(5, used, "reported OC count");
++        expect(16_106_127_360L, actualEUt, "reported final EUt");
++        expect(12, (int) duration, "reported final duration ticks");
++        if (actualEUt > supply || actualEUt <= supply / 4L) {
++            throw new AssertionError("must fit supply and reject sixth OC");
++        }
++        System.out.println("PASS " + checks + " numerical regression checks");
++        System.out.println("Reported case: " + actualEUt + " EU/t, " + (int) duration + " ticks, " + used + " OCs");
++    }
++
++    private static int oracle(long eut, long voltage) {
++        BigInteger power = BigInteger.valueOf(eut);
++        BigInteger limit = BigInteger.valueOf(voltage);
++        int count = 0;
++        while (power.shiftLeft(2).compareTo(limit) <= 0) {
++            power = power.shiftLeft(2);
++            ++count;
++        }
++        return count;
++    }
++
++    private static void expect(long expected, long actual, String name) {
++        ++checks;
++        if (expected != actual) throw new AssertionError(name + ": expected=" + expected + ", actual=" + actual);
++    }
++}
+--- a/src/main/resources/gtlcore.mixin.json
++++ b/src/main/resources/gtlcore.mixin.json
+@@ -309,6 +309,7 @@
+     "gtm.api.recipe.RecipeIteratorMixin",
+     "gtm.api.recipe.RecipeLogicAccessor",
+     "gtm.api.recipe.RecipeModifierListMixin",
++    "gtm.api.recipe.RecipeHelperOverclockMixin",
+     "gtm.api.recipe.condition.CleanroomConditionMixin",
+     "gtm.cover.ConveyorCoverMixin",
+     "gtm.cover.InfiniteWaterCoverMixin",
+--- a/build.gradle
++++ b/build.gradle
+@@ -354,3 +354,16 @@
+ tasks.named("build") {
+     dependsOn(tasks.named("verifyPackagedMixinRefmaps"))
+ }
++
++// Pure numerical regression check; do not bootstrap the Minecraft runtime.
++tasks.register("standardOverclockBudgetTest", JavaExec) {
++    group = "verification"
++    description = "Checks standard overclock budgets against exact power boundaries."
++    dependsOn(tasks.named("testClasses"))
++    classpath = files(sourceSets.main.output.classesDirs, sourceSets.test.output.classesDirs)
++    mainClass = "org.gtlcore.gtlcore.utils.StandardOverclockBudgetTest"
++}
++
++tasks.named("check") {
++    dependsOn(tasks.named("standardOverclockBudgetTest"))
++}
